@@ -1,11 +1,14 @@
 """Application bootstrap and lifecycle orchestration."""
 
 import sys
+import configparser
+import os
 
 import zapzap
-from PyQt6.QtCore import QCoreApplication, QTimer
+from PyQt6.QtCore import QCoreApplication, QTimer, Qt
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QFont
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript
 
 from zapzap.app.single_application import SingleApplication
 from zapzap.app.desktop_application_dbus import DesktopApplicationDBus
@@ -31,6 +34,7 @@ from zapzap.features.donation.controller import DonationController
 from zapzap.features.dictionaries.system_dictionary_provisioner import (
     SystemDictionaryProvisioner,
 )
+from PyQt6.QtWidgets import QWidget
 from zapzap.features.notifications.notification_service import (
     NotificationService,
     is_flatpak,
@@ -39,59 +43,117 @@ from zapzap.features.reporting.coordinator import ReportingCoordinator
 from zapzap.core.reporting.capture import CrashSessionMonitor
 from zapzap.core.diagnostics.webengine_probe import probe
 
+def load_external_font_config():
+    """Proje kök dizinindeki zapzap_font.conf dosyasından ayarları okur."""
+    config = configparser.ConfigParser()
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ini_path = os.path.join(base_dir, "zapzap_font.conf")
 
-def create_main_window(
-    webview_factory=None,
-    update_state=None,
-    update_checker=None,
-):
+    defaults = {"font_family": "Source Sans Pro", "menu_size": "11", "whatsapp_size": "12"}
+
+    if os.path.exists(ini_path):
+        config.read(ini_path)
+        if "FontSettings" in config:
+            return {
+                "font_family": config.get("FontSettings", "font_family", fallback=defaults["font_family"]),
+                "menu_size": config.getint("FontSettings", "menu_size", fallback=int(defaults["menu_size"])),
+                "whatsapp_size": config.getint("FontSettings", "whatsapp_size", fallback=int(defaults["whatsapp_size"]))
+            }
+    return {
+        "font_family": defaults["font_family"],
+        "menu_size": int(defaults["menu_size"]),
+        "whatsapp_size": int(defaults["whatsapp_size"])
+    }
+
+def create_main_window(webview_factory=None, update_state=None, update_checker=None):
     """Build a fresh MainWindow instance using the current runtime settings."""
     content = MainWindowController(
         webview_factory=webview_factory,
         update_state=update_state,
         update_checker=update_checker,
     )
+
+    # =========================================================================
+    # WHATSAPP SOHBET ALANI İÇİN KESİN FONT VE BOYUT TAZELEYİCİ
+    # =========================================================================
+    def apply_whatsapp_font():
+        f_conf = load_external_font_config()
+        try:
+            browser_ctrl = getattr(content, "browser", None)
+            if browser_ctrl:
+                page = browser_ctrl.current_webview()
+                if page:
+                    profile = page.page().profile()
+                    if profile:
+                        settings = profile.settings()
+                        settings.setFontFamily(settings.FontFamily.StandardFont, f_conf["font_family"])
+                        settings.setFontFamily(settings.FontFamily.SansSerifFont, f_conf["font_family"])
+                        settings.setFontSize(settings.FontSize.DefaultFontSize, int(f_conf["whatsapp_size"] * 1.33))
+
+                    # Birimi px yerine pt (punto) yaparak Chromium ölçekleme hatasını ezdik
+                    css_injection = f"""
+                    body, body *, html, html *, p, span, div, input, textarea, [contenteditable] {{
+                        font-family: '{f_conf["font_family"]}', sans-serif !important;
+                        font-size: {f_conf["whatsapp_size"]}pt !important;
+                    }}
+                    """
+                    js_code = f"""
+                    (function() {{
+                        var id = 'zapzap-fontsize-final-fix';
+                        var style = document.getElementById(id);
+                        if (!style) {{
+                            style = document.createElement('style');
+                            style.id = id;
+                            style.type = 'text/css';
+                            document.documentElement.appendChild(style);
+                        }}
+                        style.innerHTML = `{css_injection}`;
+                    }})();
+                    """
+                    page.page().runJavaScript(js_code)
+        except Exception:
+            pass
+
+    try:
+        browser_ctrl = getattr(content, "browser", None)
+        if browser_ctrl:
+            browser_ctrl.pages.currentChanged.connect(lambda _: apply_whatsapp_font())
+
+            QTimer.singleShot(1000, apply_whatsapp_font)
+            QTimer.singleShot(3000, apply_whatsapp_font)
+            QTimer.singleShot(6000, apply_whatsapp_font)
+            QTimer.singleShot(12000, apply_whatsapp_font)
+    except Exception:
+        pass
+    # =========================================================================
+
     appearance = AppearanceSettings()
-    window = (
-        ClientSideWindowHost(content)
-        if appearance.csr_enabled
-        else content
-    )
+    window = ClientSideWindowHost(content) if appearance.csr_enabled else content
     if DonationController.should_show():
         DonationController.showMessage(parent=window)
+
     return window
-
-
 def main():
-    # Desativa todos os prints do código
-    # sys.stdout = open(os.devnull, 'w')
-
     args, _unknown = parse_startup_options()
     apply_startup_options(args)
 
-    # QStandardPaths must know the stable application identity before the
-    # managed WebEngine dictionary directory is resolved by SetupManager.
     QCoreApplication.setApplicationName(zapzap.__appname__)
     QCoreApplication.setOrganizationDomain(zapzap.__domain__)
 
     SetupManager.apply()
     TranslationManager.apply()
 
-    # Qt requires QWebEngineView to be imported (or the corresponding
-    # application attribute to be set) before constructing QCoreApplication.
-    # Resolve the real factory here; isolated tools inject their QWidget stub.
     webview_factory = load_webview_factory()
-
-    # Instala o handler de crash
     crash_handler.install()
 
-    # Define application attributes
     app = SingleApplication(
         zapzap.__appid__, sys.argv + SetupManager.get_argv())
+
     app.setApplicationName(zapzap.__appname__)
     app.setApplicationVersion(zapzap.__version__)
     app.setDesktopFileName(zapzap.__desktopid__)
     app.setOrganizationDomain(zapzap.__domain__)
+
     crash_session_monitor = CrashSessionMonitor(
         faulthandler_path=crash_handler.faulthandler_path,
     )
@@ -101,30 +163,20 @@ def main():
     unix_signal_bridge = install_unix_signal_bridge(app)
 
     SetupManager.apply_qt_scale_factor_rounding_policy()
-
-    # QNetworkProxy is application-wide. Apply the sole global configuration
-    # before any controller can construct a functional WebEngine profile.
     ProxyManager.apply()
 
     def handle_instance_message(result):
         if result == app.RESTART_MESSAGE:
             app.restartApplication()
             return
-
         app.getWindow().xdgOpenChat(result)
 
-    # Callback instance
     app.messageReceived.connect(handle_instance_message)
-
-    # Initialize ThemeManager
     ThemeManager.start()
 
-    # The session state survives interface-only restarts, preventing a second
-    # request while restoring an already-known update in the rebuilt UI.
     update_state = UpdateState(app)
     update_checker = UpdateChecker(update_state, app)
 
-    # Create main window
     main_window = app.startInterface(
         lambda: create_main_window(
             webview_factory,
@@ -138,12 +190,12 @@ def main():
         lambda _code: app.getWindow().browser.update_spellcheck()
     )
     system_dictionary_provisioner.start()
+
     desktop_application_dbus = None
     if is_flatpak():
         desktop_application_dbus = DesktopApplicationDBus(app)
         desktop_application_dbus.start()
 
-    # Compatibilidade com comportamento legado de primeiro acesso
     if SettingsManager.get("website/open_page", True):
         QDesktopServices.openUrl(QUrl(zapzap.__website__))
         SettingsManager.set("website/open_page", False)
@@ -155,7 +207,60 @@ def main():
     ) and not should_show_initial_setup:
         main_window.hide()
     else:
+        # =========================================================================
+        # PENCEREYI SAĞ ALT KÖŞEYE OTOMATİK KONUMLANDIRMA VE ÜSTTE TUTMA
+        # =========================================================================
+        try:
+            config = configparser.ConfigParser()
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            ini_path = os.path.join(base_dir, "zapzap_font.conf")
+
+            auto_align = False
+            w_width, w_height = 380, 600
+
+            if os.path.exists(ini_path):
+                config.read(ini_path)
+                if "WindowSettings" in config:
+                    auto_align = config.getboolean("WindowSettings", "auto_align_right_bottom", fallback=False)
+                    w_width = config.getint("WindowSettings", "width", fallback=380)
+                    w_height = config.getint("WindowSettings", "height", fallback=600)
+
+            if auto_align:
+                main_window.showNormal()
+                main_window.setWindowFlags(main_window.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+
+                screen = app.primaryScreen()
+                if screen:
+                    screen_geometry = screen.availableGeometry()
+                    screen_width = screen_geometry.width()
+                    screen_height = screen_geometry.height()
+
+                    x_position = screen_width - w_width - 15
+                    y_position = screen_height - w_height - 15
+
+                    main_window.resize(w_width, w_height)
+                    main_window.move(x_position, y_position)
+        except Exception:
+            pass
+        # =========================================================================
+
         main_window.show()
+
+        # =========================================================================
+        # SESSİZ VE ERKEN TARAMAYI ÖNLEYEN FONT APPLIER (KONSOLU TEMİZ TUTAR)
+        # =========================================================================
+        f_conf = load_external_font_config()
+        custom_qt6_font = QFont(f_conf["font_family"], f_conf["menu_size"])
+        custom_qt6_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        app.setFont(custom_qt6_font)
+
+        try:
+            target_menu = main_window.menubar if hasattr(main_window, 'menubar') else (main_window.menuBar() if hasattr(main_window, 'menuBar') else None)
+            if target_menu:
+                target_menu.setFont(custom_qt6_font)
+        except Exception:
+            pass
+        # =========================================================================
 
     if should_show_initial_setup:
         QTimer.singleShot(
@@ -173,12 +278,11 @@ def main():
     app.aboutToQuit.connect(ThemeManager.stop)
     app.aboutToQuit.connect(app.shutdownInterface)
     if unix_signal_bridge is not None:
-        app.aboutToQuit.connect(unix_signal_bridge.close)
+        unix_signal_bridge.close()
 
     crash_session_monitor.mark_running()
     exit_code = app.exec()
 
-    # Defensive fallback for abnormal shutdown paths where aboutToQuit may not have run.
     crash_session_monitor.mark_shutdown()
     NotificationService.shutdown()
     ThemeManager.stop()
@@ -186,7 +290,6 @@ def main():
     if unix_signal_bridge is not None:
         unix_signal_bridge.close()
 
-    # Keep the marker through shutdown, including the defensive fallback.
     probe.record("session_end", phase="clean-exit")
     probe.close()
     crash_session_monitor.close()
