@@ -49,18 +49,26 @@ def load_external_font_config():
     base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ini_path = os.path.join(base_dir, "zapzap_font.conf")
 
-    defaults = {"font_family": "Source Sans Pro", "menu_size": "11", "whatsapp_size": "12"}
+    #defaults = {"font_family": "Source Sans Pro", "menu_size": "11", "whatsapp_size": "12"}
+    defaults = {
+        "font_family": "Source Sans Pro",
+        "font_weight": "normal",  # Eklenen kısım
+        "menu_size": "11",
+        "whatsapp_size": "12"
+    }
 
     if os.path.exists(ini_path):
         config.read(ini_path)
         if "FontSettings" in config:
             return {
                 "font_family": config.get("FontSettings", "font_family", fallback=defaults["font_family"]),
+                "font_weight": config.get("FontSettings", "font_weight", fallback=defaults["font_weight"]),
                 "menu_size": config.getint("FontSettings", "menu_size", fallback=int(defaults["menu_size"])),
                 "whatsapp_size": config.getint("FontSettings", "whatsapp_size", fallback=int(defaults["whatsapp_size"]))
             }
     return {
         "font_family": defaults["font_family"],
+        "font_weight": defaults["font_weight"],
         "menu_size": int(defaults["menu_size"]),
         "whatsapp_size": int(defaults["whatsapp_size"])
     }
@@ -74,7 +82,7 @@ def create_main_window(webview_factory=None, update_state=None, update_checker=N
     )
 
     # =========================================================================
-    # WHATSAPP SOHBET ALANI İÇİN KESİN FONT VE BOYUT TAZELEYİCİ
+    # WHATSAPP SOHBET ALANI İÇİN KESİN FONT, BOYUT VE WEIGHT TAZELEYİCİ (PT UYUMLU)
     # =========================================================================
     def apply_whatsapp_font():
         f_conf = load_external_font_config()
@@ -88,13 +96,23 @@ def create_main_window(webview_factory=None, update_state=None, update_checker=N
                         settings = profile.settings()
                         settings.setFontFamily(settings.FontFamily.StandardFont, f_conf["font_family"])
                         settings.setFontFamily(settings.FontFamily.SansSerifFont, f_conf["font_family"])
-                        settings.setFontSize(settings.FontSize.DefaultFontSize, int(f_conf["whatsapp_size"] * 1.33))
 
-                    # Birimi px yerine pt (punto) yaparak Chromium ölçekleme hatasını ezdik
+                        # Writer'daki PT değerini Chromium motorunun beklediği PX değerine çeviriyoruz (1.33 katı)
+                        whatsapp_pixel_size = int(float(f_conf["whatsapp_size"]) * 1.333)
+                        settings.setFontSize(settings.FontSize.DefaultFontSize, whatsapp_pixel_size)
+                        settings.setFontSize(settings.FontSize.DefaultFixedFontSize, whatsapp_pixel_size)
+
+                    # CSS içinde tarayıcıların daha kararlı işlediği PX değerini enjekte ediyoruz
+                    # Böylece font küçülmüyor veya sistem varsayılanına düşmüyor
                     css_injection = f"""
-                    body, body *, html, html *, p, span, div, input, textarea, [contenteditable] {{
-                        font-family: '{f_conf["font_family"]}', sans-serif !important;
-                        font-size: {f_conf["whatsapp_size"]}pt !important;
+                    span, div, p, input, textarea, [contenteditable], .selectable-text, .copyable-text {{
+                        font-family: "{f_conf["font_family"]}", sans-serif !important;
+                        font-size: {int(float(f_conf["whatsapp_size"]) * 1.333)}px !important;
+                        font-weight: {f_conf["font_weight"]} !important;
+                        line-height: normal !important;
+                    }}
+                    strong, b, ._amif, [style*="font-weight: bold"] {{
+                        font-weight: bold !important;
                     }}
                     """
                     js_code = f"""
@@ -113,6 +131,7 @@ def create_main_window(webview_factory=None, update_state=None, update_checker=N
                     page.page().runJavaScript(js_code)
         except Exception:
             pass
+
 
     try:
         browser_ctrl = getattr(content, "browser", None)
@@ -133,6 +152,8 @@ def create_main_window(webview_factory=None, update_state=None, update_checker=N
         DonationController.showMessage(parent=window)
 
     return window
+
+
 def main():
     args, _unknown = parse_startup_options()
     apply_startup_options(args)
@@ -251,8 +272,38 @@ def main():
         # =========================================================================
         f_conf = load_external_font_config()
         custom_qt6_font = QFont(f_conf["font_family"], f_conf["menu_size"])
+        # 2. Dosyadan gelen string ağırlığı Qt/Linux'un anlayacağı sayıya eşleyin
+        weight_map = {
+            "thin": 100, "light": 300, "regular": 400, "normal": 400,
+            "medium": 500, "semibold": 600, "bold": 700, "black": 900
+        }
+        raw_weight = str(f_conf["font_weight"]).lower().strip()
+
+        # Kullanıcı dosyaya doğrudan "700" veya "600" gibi sayısal metin yazdıysa doğrudan int'e çevir,
+        # Kelime yazdıysa ("bold" vb.) sözlükten karşılığını al, bulamazsa varsayılan 400 (normal) yap.
+        if raw_weight.isdigit():
+            target_weight = int(raw_weight)
+        else:
+            target_weight = weight_map.get(raw_weight, 400)
+
+        # Ağırlığı fonta yükleyin
+        custom_qt6_font.setWeight(target_weight)
         custom_qt6_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+
+        # 3. Uygulamaya küresel fontu set edin
         app.setFont(custom_qt6_font)
+
+        # 4. MANJARO / LINUX İÇİN KRİTİK ADIM:
+        # app.setFont bazen alt menülerde weight bilgisini kaybeder.
+        # Aşağıdaki StyleSheet, tüm alt bileşenlerin (menü, buton vb.) dosyadan gelen ağırlığı kesin olarak uygulamasını sağlar.
+        global_stylesheet = f"""
+            QWidget {{
+                font-family: "{f_conf['font_family']}";
+                font-size: {f_conf['menu_size']}px;
+                font-weight: {f_conf['font_weight']};
+            }}
+        """
+        app.setStyleSheet(global_stylesheet)
 
         try:
             target_menu = main_window.menubar if hasattr(main_window, 'menubar') else (main_window.menuBar() if hasattr(main_window, 'menuBar') else None)
